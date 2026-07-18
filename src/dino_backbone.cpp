@@ -167,8 +167,8 @@ bool DinoBackbone::forward(const std::vector<float>& input_chw, int H, int W,
     // --- host post-process matching get_intermediate_layers (width == 2*embed) ---
     // feat   = cat([local_x, vit_norm(x)]) over channels, patches 1..256  -> [256,1536]
     // cam    = cat([local_x[token0], x[token0]]) RAW (no norm)            -> [1536]
-    ggml_tensor* nw = ml_.tensor("vit.norm.weight");
-    ggml_tensor* nb = ml_.tensor("vit.norm.bias");
+    ggml_tensor* nw = ml_.host_tensor("vit.norm.weight");
+    ggml_tensor* nb = ml_.host_tensor("vit.norm.bias");
     const float* nwp=(const float*)nw->data;
     const float* nbp=(const float*)nb->data;
     auto layernorm_host=[&](const float* row)->std::vector<float>{
@@ -566,8 +566,8 @@ bool DinoBackbone::forward_mv_ordered(const std::vector<std::vector<float>>& vie
     if (!ok) return false;
 
     // Host post-process per view (matches the S=1 path, repeated per view-slice).
-    ggml_tensor* nw = ml_.tensor("vit.norm.weight");
-    ggml_tensor* nb = ml_.tensor("vit.norm.bias");
+    ggml_tensor* nw = ml_.host_tensor("vit.norm.weight");
+    ggml_tensor* nb = ml_.host_tensor("vit.norm.bias");
     const float* nwp=(const float*)nw->data;
     const float* nbp=(const float*)nb->data;
     auto layernorm_host=[&](const float* row)->std::vector<float>{

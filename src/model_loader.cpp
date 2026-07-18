@@ -15,16 +15,24 @@ static bool g_gpu_mode = false;
 void set_gpu_mode(bool on){ g_gpu_mode = on; }
 bool gpu_mode(){ return g_gpu_mode; }
 
-// Weights read directly on the HOST via ->data during graph build (they feed
-// host-computed graph INPUTS, not graph nodes), so they MUST stay in
+// Weights read directly on the HOST via ->data during graph build feed
+// host-computed graph INPUTS (not graph nodes), so they MUST stay in
 // host-accessible memory and are never mirrored to the device:
 //   - "vit.pos_embed"   : host bicubic interp in DinoBackbone::interp_pos_embed
 //   - "vit.camera_token": host camera-token inject in DinoBackbone::forward*
-//   - "vit.norm.weight" / "vit.norm.bias": host post-norm in DinoBackbone
 // (The metric branch aliases m_vit.* -> vit.* so the same names apply.)
-static bool is_host_read_tensor(const std::string& name) {
-    return name == "vit.pos_embed"   || name == "vit.camera_token" ||
-           name == "vit.norm.weight" || name == "vit.norm.bias";
+static bool is_host_only_tensor(const std::string& name) {
+    return name == "vit.pos_embed" || name == "vit.camera_token";
+}
+
+// Weights that are DUAL-USE: real ggml graph operands in the fused path
+// (DinoBackbone::build_feats_graph -> layernorm(x, vit.norm.{w,b})), AND read
+// directly on the host in the unfused / multi-view path (layernorm_host). These
+// must be mirrored to the device so the graph has a valid backend buffer (else
+// the Metal encoder derefs a NULL buffer and segfaults), while their host
+// originals are preserved for the host readers via ModelLoader::host_tensor().
+static bool is_host_also_tensor(const std::string& name) {
+    return name == "vit.norm.weight" || name == "vit.norm.bias";
 }
 
 static uint32_t kv_u32(gguf_context* g, const char* k, uint32_t d=0){
@@ -192,10 +200,14 @@ bool ModelLoader::offload_weights(Backend& be){
     std::unordered_map<std::string, ggml_tensor*> newmap; newmap.reserve(n);
     size_t n_dev = 0;
     for (auto& kv : tensors_) {
-        if (is_host_read_tensor(kv.first)) {
+        if (is_host_only_tensor(kv.first)) {
             newmap.emplace(kv.first, kv.second);        // keep host tensor as-is
             continue;
         }
+        // Dual-use weights: preserve the host original for host_tensor() reads,
+        // then fall through to mirror them onto the device for the graph.
+        if (is_host_also_tensor(kv.first))
+            host_tensors_.emplace(kv.first, kv.second);
         ggml_tensor* s = kv.second;
         auto it = src2dev.find(s);
         if (it != src2dev.end()) {                      // alias of an already-mirrored tensor
@@ -214,8 +226,15 @@ bool ModelLoader::offload_weights(Backend& be){
     for (auto& pr : ups)
         ggml_backend_tensor_set(pr.first, pr.second, 0, ggml_nbytes(pr.first));
     tensors_.swap(newmap);   // graphs now reference the device-resident weights
-    DA_LOG("offload_weights: %zu weights -> %s (%zu host-read tensors kept on CPU)",
-           n_dev, be.device_name().c_str(), (size_t)4);
+    DA_LOG("offload_weights: %zu weights -> %s (%zu host-only tensors kept on CPU, "
+           "%zu dual-use weights mirrored + host-preserved)",
+           n_dev, be.device_name().c_str(), (size_t)2, host_tensors_.size());
     return true;
+}
+
+ggml_tensor* ModelLoader::host_tensor(const std::string& name) const {
+    auto it = host_tensors_.find(name);
+    if (it != host_tensors_.end()) return it->second;  // preserved host original
+    return tensor(name);                               // CPU path: never offloaded
 }
 } // namespace da

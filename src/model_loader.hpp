@@ -38,12 +38,19 @@ public:
     bool load(const std::string& path);
     const Config& config() const { return cfg_; }
     ggml_tensor* tensor(const std::string& name) const;
+    // Host-resident copy of a dual-use weight (e.g. vit.norm.{weight,bias}) that is
+    // BOTH a graph operand (device-resident after offload) AND read directly on the
+    // host (layernorm_host). Falls back to tensor() when not offloading. Use this at
+    // every `->data` read site so it stays valid on GPU backends.
+    ggml_tensor* host_tensor(const std::string& name) const;
     bool offload_weights(Backend& be);
 private:
     Config cfg_;
     gguf_context* gguf_ = nullptr;
     ggml_context* ctx_  = nullptr;
     std::unordered_map<std::string, ggml_tensor*> tensors_;
+    // Preserved host originals of dual-use weights mirrored to the device.
+    std::unordered_map<std::string, ggml_tensor*> host_tensors_;
     ggml_context* device_ctx_ = nullptr;
     ggml_backend_buffer* gpu_buf_ = nullptr;
 };
