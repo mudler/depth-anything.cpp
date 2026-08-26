@@ -94,6 +94,7 @@
     <div class="play hide" id="playrow">
       <button id="playbtn">▶</button>
       <button id="flybtn" title="Flythrough: move the camera along the capture path as the slider reveals frames" disabled>🎥</button>
+      <button id="meshbtn" class="hide" title="Render the precomputed temporal exposed-face mesh instead of cubes">Mesh</button>
       <input type="range" id="steprange" min="0" max="0" value="0"/>
       <span id="stepnum" style="color:#8b93a1;font-size:11px">—</span>
       <label id="brightwrap" title="Viewer brightness — raise to compensate for cube face-shading in voxel mode (overbright)."
@@ -157,6 +158,9 @@
       <div title="How far apart two doubled surfaces still merge, as a multiple of the voxel (max merged gap = 2×). Higher removes more ghosting/drift but can fuse genuinely-separate surfaces. Default 4.">
         <label class="fld">Merge range <span id="fusetruncval">4× voxel</span></label>
         <input type="range" id="fusetrunc" style="width:100%" min="2" max="10" step="1" value="4"/></div>
+      <label id="fld-temporalmesh" class="fld" style="display:flex;align-items:center;gap:6px;text-transform:none;flex-basis:100%"
+             title="Precompute exact exposed voxel faces with per-frame lifetimes, so playback can render a merged surface without cubes.">
+        <input type="checkbox" id="temporalmesh" checked/> Merged playback mesh</label>
     </div>
 
     <button class="go" id="gen" disabled>Generate</button>
@@ -282,6 +286,46 @@ const cubeGeom = (()=>{ const V=[[-.5,-.5,-.5],[.5,-.5,-.5],[.5,.5,-.5],[-.5,.5,
            {n:[1,0,0],i:[1,5,6,1,6,2]},{n:[0,-1,0],i:[0,4,5,0,5,1]},{n:[0,1,0],i:[3,2,6,3,6,7]}];
   const a=[]; for(const f of F) for(const k of f.i){ a.push(V[k][0],V[k][1],V[k][2], f.n[0],f.n[1],f.n[2]); } return new Float32Array(a); })();
 const cubeBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,cubeBuf); gl.bufferData(gl.ARRAY_BUFFER,cubeGeom,gl.STATIC_DRAW);
+
+// --- temporal exposed-face mesh program ---------------------------------------
+// DTVM stores exact integer grid faces plus frame lifetimes. Dirty chunks are
+// expanded into ordinary triangle buffers; no neighbour search or cube geometry
+// is performed in the browser.
+const MVERT=`#version 300 es
+precision highp float; precision highp int;
+uniform mat4 u_proj,u_view; uniform float u_voxel;
+in ivec3 a_grid; in uint a_mdir; in vec3 a_mrgb;
+out vec3 v_rgb; out float v_shade;
+vec3 faceNormal(uint d){
+  if(d==0u)return vec3(-1,0,0); if(d==1u)return vec3(1,0,0);
+  if(d==2u)return vec3(0,-1,0); if(d==3u)return vec3(0,1,0);
+  if(d==4u)return vec3(0,0,-1); return vec3(0,0,1);
+}
+void main(){
+  vec3 p=vec3(a_grid)*u_voxel; p.yz=-p.yz;
+  vec3 n=faceNormal(a_mdir); n.yz=-n.yz;
+  gl_Position=u_proj*u_view*vec4(p,1.0); v_rgb=a_mrgb;
+  vec3 L=normalize(vec3(0.32,0.9,0.32)); v_shade=0.40+0.60*max(dot(n,L),0.0);
+}`;
+const MFRAG=`#version 300 es
+precision highp float; uniform float u_bright; in vec3 v_rgb; in float v_shade; out vec4 o;
+void main(){o=vec4(v_rgb*v_shade*u_bright,1.0);}`;
+const meshProg=gl.createProgram();
+gl.attachShader(meshProg,shader(gl.VERTEX_SHADER,MVERT)); gl.attachShader(meshProg,shader(gl.FRAGMENT_SHADER,MFRAG)); gl.linkProgram(meshProg);
+if(!gl.getProgramParameter(meshProg,gl.LINK_STATUS)){setStatus(gl.getProgramInfoLog(meshProg),true);throw new Error("mesh link");}
+const meshU={proj:gl.getUniformLocation(meshProg,"u_proj"),view:gl.getUniformLocation(meshProg,"u_view"),
+  voxel:gl.getUniformLocation(meshProg,"u_voxel"),bright:gl.getUniformLocation(meshProg,"u_bright")};
+const aMgrid=gl.getAttribLocation(meshProg,"a_grid"),aMdir=gl.getAttribLocation(meshProg,"a_mdir"),aMrgb=gl.getAttribLocation(meshProg,"a_mrgb");
+// Six CCW vertices per outward-facing unit-grid quad, in OpenCV grid axes. The
+// renderer flips y+z together (determinant +1), so winding remains CCW in GL.
+const faceCorners=[
+ [[0,0,0],[0,0,1],[0,1,1],[0,0,0],[0,1,1],[0,1,0]],
+ [[1,0,0],[1,1,0],[1,1,1],[1,0,0],[1,1,1],[1,0,1]],
+ [[0,0,0],[1,0,0],[1,0,1],[0,0,0],[1,0,1],[0,0,1]],
+ [[0,1,0],[0,1,1],[1,1,1],[0,1,0],[1,1,1],[1,1,0]],
+ [[0,0,0],[0,1,0],[1,1,0],[0,0,0],[1,1,0],[1,0,0]],
+ [[0,0,1],[1,0,1],[1,1,1],[0,0,1],[1,1,1],[0,1,1]]
+];
 gl.useProgram(prog);
 
 let count=0, positions=new Float32Array(0), texData=new Uint32Array(0), framed=false;
@@ -302,6 +346,83 @@ function ingestBytes(bytes){ const n=Math.floor(bytes.byteLength/ROW); ensureCap
   for(let i=0;i<n;i++){ positions[i*3]=f32[i*8]; positions[i*3+1]=f32[i*8+1]; positions[i*3+2]=f32[i*8+2]; }
   count=n; uploadTexture(); $("s-splats").textContent=count.toLocaleString();
   if(count>2000) frameToData(); }
+
+// DTVM temporal mesh state. A face record is stored once with its visible frame
+// interval. Playback toggles records and rebuilds only the affected 16^3 chunks.
+const MESH_CHUNK=16;
+let temporalMeshReady=false,temporalMeshView=true,temporalVoxel=0,temporalFrames=0,temporalFrame=-1,temporalLoadToken=0;
+let temporalXYZ=null,temporalFirst=null,temporalEnd=null,temporalDir=null,temporalRGB=null,temporalActive=null;
+let temporalStarts=[],temporalEnds=[],temporalChunks=new Map(),temporalActiveFaces=0;
+function clearTemporalMesh(){
+  temporalLoadToken++; for(const c of temporalChunks.values())if(c.buf)gl.deleteBuffer(c.buf);
+  temporalMeshReady=false;temporalVoxel=0;temporalFrames=0;temporalFrame=-1;temporalActiveFaces=0;
+  temporalXYZ=temporalFirst=temporalEnd=temporalDir=temporalRGB=temporalActive=null;
+  temporalStarts=[];temporalEnds=[];temporalChunks=new Map();
+  $("meshbtn").classList.add("hide");$("meshbtn").classList.remove("on");
+}
+function temporalChunkFor(id){
+  const x=temporalXYZ[3*id],y=temporalXYZ[3*id+1],z=temporalXYZ[3*id+2];
+  const key=`${Math.floor(x/MESH_CHUNK)},${Math.floor(y/MESH_CHUNK)},${Math.floor(z/MESH_CHUNK)}`;
+  return temporalChunks.get(key);
+}
+function setTemporalFace(id,on){
+  const v=on?1:0;if(temporalActive[id]===v)return;
+  temporalActive[id]=v;temporalActiveFaces+=on?1:-1;const c=temporalChunkFor(id);if(c)c.dirty=true;
+}
+function setTemporalFrame(target,force=false){
+  if(!temporalMeshReady)return;
+  target=Math.max(0,Math.min(temporalFrames-1,target|0));
+  if(force||temporalFrame<0){
+    temporalActive.fill(0);temporalActiveFaces=0;
+    for(let i=0;i<temporalActive.length;i++){
+      const on=temporalFirst[i]<=target&&(temporalEnd[i]===65535||target<temporalEnd[i]);
+      temporalActive[i]=on?1:0;if(on)temporalActiveFaces++;
+    }
+    for(const c of temporalChunks.values())c.dirty=true;
+  }else if(target>temporalFrame){
+    for(let f=temporalFrame+1;f<=target;f++){
+      for(const id of temporalEnds[f]||[])setTemporalFace(id,false);
+      for(const id of temporalStarts[f]||[])setTemporalFace(id,true);
+    }
+  }else if(target<temporalFrame){
+    for(let f=temporalFrame;f>target;f--){
+      for(const id of temporalStarts[f]||[])setTemporalFace(id,false);
+      for(const id of temporalEnds[f]||[])setTemporalFace(id,true);
+    }
+  }
+  temporalFrame=target;
+  if(temporalMeshView)$("s-splats").textContent=temporalActiveFaces.toLocaleString()+" faces";
+}
+function rebuildTemporalChunks(){
+  for(const c of temporalChunks.values()){
+    if(!c.dirty)continue;c.dirty=false;let nf=0;for(const id of c.ids)if(temporalActive[id])nf++;
+    const bytes=new Uint8Array(nf*6*16),dv=new DataView(bytes.buffer);let o=0;
+    for(const id of c.ids){if(!temporalActive[id])continue;
+      const x=temporalXYZ[3*id],y=temporalXYZ[3*id+1],z=temporalXYZ[3*id+2],d=temporalDir[id];
+      for(const q of faceCorners[d]){dv.setInt32(o,x+q[0],true);dv.setInt32(o+4,y+q[1],true);dv.setInt32(o+8,z+q[2],true);
+        bytes[o+12]=d;bytes[o+13]=temporalRGB[3*id];bytes[o+14]=temporalRGB[3*id+1];bytes[o+15]=temporalRGB[3*id+2];o+=16;}
+    }
+    if(!c.buf)c.buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,c.buf);gl.bufferData(gl.ARRAY_BUFFER,bytes,gl.DYNAMIC_DRAW);c.nverts=nf*6;
+  }
+}
+async function loadTemporalMesh(url){
+  const token=++temporalLoadToken;
+  const resp=await fetch(url);if(!resp.ok)throw new Error("temporal mesh HTTP "+resp.status);
+  const buf=await resp.arrayBuffer();if(token!==temporalLoadToken)return;const dv=new DataView(buf);
+  if(buf.byteLength<32||String.fromCharCode(...new Uint8Array(buf,0,4))!=="DTVM"||dv.getUint16(4,true)!==1||dv.getUint32(28,true)!==24)throw new Error("invalid DTVM mesh");
+  temporalFrames=dv.getUint32(12,true);const n=dv.getUint32(16,true);temporalVoxel=dv.getFloat32(24,true);
+  if(32+n*24!==buf.byteLength||temporalFrames<1||!(temporalVoxel>0))throw new Error("invalid DTVM bounds");
+  temporalXYZ=new Int32Array(n*3);temporalFirst=new Uint16Array(n);temporalEnd=new Uint16Array(n);temporalDir=new Uint8Array(n);temporalRGB=new Uint8Array(n*3);temporalActive=new Uint8Array(n);
+  temporalStarts=Array.from({length:temporalFrames},()=>[]);temporalEnds=Array.from({length:temporalFrames},()=>[]);temporalChunks=new Map();
+  for(let i=0;i<n;i++){const o=32+i*24,x=dv.getInt32(o,true),y=dv.getInt32(o+4,true),z=dv.getInt32(o+8,true),first=dv.getUint16(o+12,true),end=dv.getUint16(o+14,true);
+    temporalXYZ.set([x,y,z],3*i);temporalFirst[i]=first;temporalEnd[i]=end;temporalDir[i]=dv.getUint8(o+16);temporalRGB.set(new Uint8Array(buf,o+17,3),3*i);
+    if(first<temporalFrames)temporalStarts[first].push(i);if(end!==65535&&end<temporalFrames)temporalEnds[end].push(i);
+    const key=`${Math.floor(x/MESH_CHUNK)},${Math.floor(y/MESH_CHUNK)},${Math.floor(z/MESH_CHUNK)}`;
+    let c=temporalChunks.get(key);if(!c){c={ids:[],buf:null,nverts:0,dirty:true};temporalChunks.set(key,c);}c.ids.push(i);
+  }
+  temporalMeshReady=true;temporalFrame=-1;setTemporalFrame(steps[stepI]?steps[stepI].n-1:temporalFrames-1,true);
+  $("meshbtn").classList.remove("hide");$("meshbtn").classList.toggle("on",temporalMeshView);
+}
 
 const worker = new Worker(URL.createObjectURL(new Blob([`
 let pos=null,n=0;
@@ -439,9 +560,20 @@ function render(){
     const fovy=1.0; proj=perspective(fovy,aspect,Math.max(0.01,0.004*sceneDiag),Math.max(100,20*sceneDiag)); fy=ch/(2*Math.tan(fovy/2)); fx=fy;
   }
   gl.clearColor(0.043,0.051,0.063,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
-  if(curMode==="voxels"){
+  if(curMode==="voxels"&&temporalMeshView&&temporalMeshReady){
+    // Precomputed per-frame exposed faces: ordinary depth-tested, back-face-culled
+    // triangle chunks. Only chunks touched by this frame's face events are rebuilt.
+    rebuildTemporalChunks();gl.enable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.enable(gl.CULL_FACE);gl.frontFace(gl.CCW);gl.cullFace(gl.BACK);gl.useProgram(meshProg);
+    gl.uniformMatrix4fv(meshU.view,false,view);gl.uniformMatrix4fv(meshU.proj,false,proj);gl.uniform1f(meshU.voxel,temporalVoxel);gl.uniform1f(meshU.bright,viewBright);
+    for(const c of temporalChunks.values()){if(!c.buf||c.nverts===0)continue;gl.bindBuffer(gl.ARRAY_BUFFER,c.buf);
+      gl.enableVertexAttribArray(aMgrid);gl.vertexAttribIPointer(aMgrid,3,gl.INT,16,0);
+      gl.enableVertexAttribArray(aMdir);gl.vertexAttribIPointer(aMdir,1,gl.UNSIGNED_BYTE,16,12);
+      gl.enableVertexAttribArray(aMrgb);gl.vertexAttribPointer(aMrgb,3,gl.UNSIGNED_BYTE,true,16,13);
+      gl.vertexAttribDivisor(aMgrid,0);gl.vertexAttribDivisor(aMdir,0);gl.vertexAttribDivisor(aMrgb,0);
+      gl.drawArrays(gl.TRIANGLES,0,c.nverts);}
+  }else if(curMode==="voxels"){
     // Opaque, depth-tested cubes — no back-to-front sort needed.
-    gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.useProgram(cubeProg);
+    gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.useProgram(cubeProg);
     gl.uniformMatrix4fv(cubeU.view,false,view); gl.uniformMatrix4fv(cubeU.proj,false,proj);
     gl.uniform1f(cubeU.bright, viewBright);
     if(aCorner>=0) gl.disableVertexAttribArray(aCorner);
@@ -452,7 +584,7 @@ function render(){
     if(revInt>0) gl.drawArraysInstanced(gl.TRIANGLES,0,36,revInt);
   }else{
     if(sortDirty){ requestSort(view,revInt); sortDirty=false; }
-    gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.useProgram(prog);
+    gl.disable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.disable(gl.CULL_FACE); gl.useProgram(prog);
     gl.uniformMatrix4fv(U.view,false,view); gl.uniformMatrix4fv(U.proj,false,proj);
     gl.uniform2f(U.focal,fx,fy); gl.uniform2f(U.viewport,canvas.width,canvas.height);
     gl.uniform1f(U.bright, viewBright);
@@ -536,10 +668,12 @@ function updateControls(){
   $('vidparams').classList.toggle('hide',!vid);
   $('vidclean').classList.toggle('hide',!vid||gs);
   $('fuseparams').classList.toggle('hide',!vid||gs||!fuseOn);
-  show('fld-window',!gs); show('fld-overlap',!gs); show('fld-conf',!gs); show('fld-nearbias',!gs);
+  show('fld-window',!gs); show('fld-overlap',!gs); show('fld-conf',!gs);
+  show('fld-nearbias',!gs&&!vox);
   show('fld-voxelres', vox && !fuseOn);          // fusion drives the cube grid when on
   show('fld-surfels', !gs && !vox);
   show('fld-metric', !gs && metricModel);
+  show('fld-temporalmesh', vox && fuseOn);
 }
 
 // Surface-fusion (TSDF) sliders: live value readouts (visibility via updateControls).
@@ -579,6 +713,7 @@ $("gen").onclick=async()=>{
       fd.append("fuse",$("fuse").checked?"1":"0");
       fd.append("fuse_voxel_frac",$("fusedetail").value);
       fd.append("fuse_trunc_mult",$("fusetrunc").value);
+      fd.append("temporal_mesh",$("temporalmesh").checked?"1":"0");
       fd.append("metric",$("metric").checked?"1":"0");
       fd.append("near_bias",$("nearbias").value);
       fd.append("surfels",$("surfels").checked?"1":"0");
@@ -624,6 +759,7 @@ async function loadScenes(){
 async function openScene(name){
   curScene=name; curBust=Date.now();   // per-open cache-bust: a re-baked scene reuses
   curSplatURL="";                       // force the single cloud file to (re)load for this scene
+  clearTemporalMesh(); temporalMeshView=true;
   hidePip();                            // reset the source-frame PiP for the new scene
   document.querySelectorAll(".card").forEach(c=>c.classList.toggle("active",c.dataset.name===name));
   const m=await (await fetch(`/scenes-assets/${name}/manifest.json?v=${curBust}`)).json();
@@ -639,7 +775,11 @@ async function openScene(name){
   // Open on the FINAL, full cloud — don't auto-replay the build-up from step 0 (that
   // read as "the scene reset to sparse and rebuilt"). Press ▶ to watch the build-up.
   stepI=steps.length-1; $("steprange").value=stepI; distLock=false;
-  await showStep(stepI,true);
+  const meshPromise=(curMode==="voxels"&&m.temporal_mesh&&m.temporal_mesh.file)
+    ?loadTemporalMesh(`/scenes-assets/${name}/${m.temporal_mesh.file}?v=${curBust}`).catch(e=>{console.error(e);setStatus("mesh: "+e.message,true);})
+    :Promise.resolve();
+  await showStep(stepI,true); await meshPromise;
+  if(temporalMeshReady)setTemporalFrame((steps[stepI].n|0)-1);
 }
 async function showStep(i,reframe){ stepI=i; $("steprange").value=i; const st=steps[i];
   $("stepnum").textContent=`${st.n}`;   // just the frame number; keeps the row short + stable
@@ -653,6 +793,7 @@ async function showStep(i,reframe){ stepI=i; $("steprange").value=i; const st=st
   } else {
     revealTarget = (st.npts!=null&&st.npts>0) ? Math.min(st.npts,count) : count;  // same file: ease the reveal
   }
+  if(temporalMeshReady)setTemporalFrame((st.n|0)-1);
 }
 $("brightness").oninput=()=>{ viewBright=+$("brightness").value; };  // runtime; continuous render picks it up
 $("steprange").oninput=()=>{ stopPlay(); showStep(+$("steprange").value,false); };
@@ -662,6 +803,9 @@ $("flybtn").onclick=()=>{ if($("flybtn").disabled) return;
   if(flythrough){ flyInit=false; }                 // snap the camera onto the path
   else { framed=false; distLock=false; frameToData(); hidePip(); }  // restore a framed orbit view
 };
+$("meshbtn").onclick=()=>{if(!temporalMeshReady)return;temporalMeshView=!temporalMeshView;
+  $("meshbtn").classList.toggle("on",temporalMeshView);
+  $("s-splats").textContent=temporalMeshView?temporalActiveFaces.toLocaleString()+" faces":count.toLocaleString();};
 function playFrom(i){ stopPlay(); $("playbtn").textContent="⏸"; let k=i; distLock=(k>0);
   // Start the reveal from this step so the build-up grows forward (not eases down from full).
   if(steps[i]&&steps[i].npts!=null) reveal=Math.min(steps[i].npts,count);

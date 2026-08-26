@@ -8,6 +8,7 @@
 #include "stream.hpp"
 #include "fuse.hpp"
 #include "tsdf.hpp"
+#include "voxel_mesh.hpp"
 #include "common.hpp"
 #include <cctype>
 #include <chrono>
@@ -31,6 +32,10 @@ struct da_ctx {
     // da_capi_set_fuse_params, which dodges the stream's arg-count ceiling). 0 => the
     // fuse_tsdf defaults (voxel = 0.4% of bbox diag, truncation = 4 voxels).
     double fuse_voxel_frac = 0.0, fuse_trunc_mult = 0.0;
+    // Optional temporal exposed-face mesh from the most recent streamed fuse.
+    // Configuration is separate because points_stream is at the PureGo arg ceiling.
+    bool temporal_voxel_mesh_enabled = false;
+    std::vector<uint8_t> temporal_voxel_mesh;
 };
 
 static char* dup_cstr(const std::string& s){
@@ -85,7 +90,7 @@ static bool capi_run_nested(da_ctx* c, const char* image_path,
 }
 
 extern "C" {
-int da_capi_abi_version(void){ return 10; }
+int da_capi_abi_version(void){ return 11; }
 
 // Scene-relative TSDF fusion knobs applied by the NEXT da_capi_points_stream when
 // its fuse flag is set. voxel_frac = voxel edge as a fraction of the bbox diagonal
@@ -96,6 +101,10 @@ void da_capi_set_fuse_params(da_ctx* c, double voxel_frac, double trunc_mult){
     if (!c) return;
     c->fuse_voxel_frac = voxel_frac;
     c->fuse_trunc_mult = trunc_mult;
+}
+void da_capi_set_temporal_voxel_mesh(da_ctx* c, int enabled){
+    if (!c) return;
+    c->temporal_voxel_mesh_enabled = (enabled != 0);
 }
 da_ctx* da_capi_load(const char* path, int n_threads){
     if (!path) return nullptr;
@@ -388,7 +397,7 @@ int da_capi_points_stream(da_ctx* c, const char** image_paths, int n_images,
     if (out_xyz) *out_xyz = nullptr;
     if (out_rgb) *out_rgb = nullptr;
     if (out_radius) *out_radius = nullptr;
-    if (c){ c->frame_pos.clear(); c->frame_fwd.clear(); }
+    if (c){ c->frame_pos.clear(); c->frame_fwd.clear(); c->temporal_voxel_mesh.clear(); }
     if (!c || !c->engine || !image_paths || n_images <= 0){ if (c) c->last_error = "points_stream: bad args"; return -1; }
     if (c->engine->is_mono() || c->engine->is_da2()){
         c->last_error = "points_stream: model has no camera pose; use a DualDPT DA3 model"; return -1; }
@@ -435,11 +444,13 @@ int da_capi_points_stream(da_ctx* c, const char** image_paths, int n_images,
         for (int f = 0; f < F; ++f) for (int k = 0; k < sc.counts[f]; ++k) in_frame.push_back(f);
         if (in_frame.size() != pre_pts) in_frame.clear();   // only use if it lines up
         std::vector<int> out_frame;
+        da::TsdfSurface temporal_surface;
         auto t_fuse0 = std::chrono::steady_clock::now();
         // frame_pos orients normals toward the observing camera (correct SDF sign);
         // weights default to 1/radius inside (near/high-confidence points dominate).
         int nf = da::fuse_tsdf(sc.xyz, sc.rgb, sc.radius, tp, nullptr, &sc.frame_pos,
-                               in_frame.empty() ? nullptr : &in_frame, &out_frame);
+                               in_frame.empty() ? nullptr : &in_frame, &out_frame,
+                               c->temporal_voxel_mesh_enabled ? &temporal_surface : nullptr);
         DA_LOG("stream timing: tsdf(cpu)=%.2fs  %zu->%d pts",
                std::chrono::duration<double>(std::chrono::steady_clock::now()-t_fuse0).count(),
                pre_pts, nf);
@@ -453,6 +464,12 @@ int da_capi_points_stream(da_ctx* c, const char** image_paths, int n_images,
         } else {
             long pre = 0; for (int cc : sc.counts) pre += cc;
             if (pre > 0) for (int& cc : sc.counts) cc = (int)((long long)cc * nf / pre);
+        }
+        if (c->temporal_voxel_mesh_enabled && !temporal_surface.voxels.empty()) {
+            c->temporal_voxel_mesh = da::encode_temporal_voxel_mesh(temporal_surface, (uint32_t)F);
+            DA_LOG("temporal voxel mesh: %zu voxels, %.2f MiB",
+                   temporal_surface.voxels.size(),
+                   (double)c->temporal_voxel_mesh.size() / (1024.0 * 1024.0));
         }
     }
 
@@ -501,6 +518,22 @@ int da_capi_stream_last_poses(da_ctx* c, float** out_pos, float** out_fwd, int* 
     if (out_pos) *out_pos = pos; else std::free(pos);
     if (out_fwd) *out_fwd = fwd; else std::free(fwd);
     if (out_nframes) *out_nframes = (int)(sz / 3);
+    return 0;
+}
+
+int da_capi_stream_last_voxel_mesh(da_ctx* c, unsigned char** out_data, size_t* out_size){
+    if (out_data) *out_data = nullptr;
+    if (out_size) *out_size = 0;
+    if (!c || c->temporal_voxel_mesh.empty()){
+        if (c) c->last_error = "stream_last_voxel_mesh: no temporal mesh available";
+        return -1;
+    }
+    const size_t n = c->temporal_voxel_mesh.size();
+    unsigned char* data = (unsigned char*)std::malloc(n);
+    if (!data){ c->last_error = "stream_last_voxel_mesh: oom"; return -1; }
+    std::memcpy(data, c->temporal_voxel_mesh.data(), n);
+    if (out_data) *out_data = data; else std::free(data);
+    if (out_size) *out_size = n;
     return 0;
 }
 

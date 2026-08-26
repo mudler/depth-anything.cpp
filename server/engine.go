@@ -1,5 +1,5 @@
 // engine.go — purego bindings to libdepthanything (the flat C API in
-// include/da_capi.h, ABI 7). No cgo: the shared library is dlopen'd once and each
+// include/da_capi.h, ABI 11). No cgo: the shared library is dlopen'd once and each
 // model is loaded as its own da_ctx. A context is NOT thread-safe (one ggml
 // backend + compute graph), so all inference is serialized by the caller.
 package main
@@ -28,10 +28,12 @@ type capi struct {
 	pointsStream func(ctx uintptr, paths uintptr, n, chunk, overlap int32, confPct float64,
 		ptSize float32, budget int32, icpRefine, loopClose, fuse, metric int32, fuseVoxel float64,
 		outN, outCounts, outXyz, outRgb, outRad unsafe.Pointer) int32
-	streamPoses func(ctx uintptr, outPos, outFwd, outNFrames unsafe.Pointer) int32
+	streamPoses     func(ctx uintptr, outPos, outFwd, outNFrames unsafe.Pointer) int32
+	streamVoxelMesh func(ctx uintptr, outData, outSize unsafe.Pointer) int32
 	// Scene-relative TSDF fusion knobs applied to the next pointsStream fuse.
-	setFuseParams func(ctx uintptr, voxelFrac, truncMult float64)
-	gaussians func(ctx uintptr, path string,
+	setFuseParams        func(ctx uintptr, voxelFrac, truncMult float64)
+	setTemporalVoxelMesh func(ctx uintptr, enabled int32)
+	gaussians            func(ctx uintptr, path string,
 		outN, outXyz, outScale, outQuat, outRgb, outOpacity,
 		outIntr, outW, outH unsafe.Pointer) int32
 }
@@ -43,6 +45,9 @@ func openCAPI(libPath string) (*capi, error) {
 	}
 	a := &capi{handle: h}
 	purego.RegisterLibFunc(&a.abiVersion, h, "da_capi_abi_version")
+	if abi := a.abiVersion(); abi < 11 {
+		return nil, fmt.Errorf("libdepthanything ABI %d is too old; demo requires >=11", abi)
+	}
 	purego.RegisterLibFunc(&a.load, h, "da_capi_load")
 	purego.RegisterLibFunc(&a.loadNested, h, "da_capi_load_nested")
 	purego.RegisterLibFunc(&a.freeCtx, h, "da_capi_free")
@@ -52,7 +57,9 @@ func openCAPI(libPath string) (*capi, error) {
 	purego.RegisterLibFunc(&a.pointsMulti, h, "da_capi_points_multi")
 	purego.RegisterLibFunc(&a.pointsStream, h, "da_capi_points_stream")
 	purego.RegisterLibFunc(&a.streamPoses, h, "da_capi_stream_last_poses")
+	purego.RegisterLibFunc(&a.streamVoxelMesh, h, "da_capi_stream_last_voxel_mesh")
 	purego.RegisterLibFunc(&a.setFuseParams, h, "da_capi_set_fuse_params")
+	purego.RegisterLibFunc(&a.setTemporalVoxelMesh, h, "da_capi_set_temporal_voxel_mesh")
 	purego.RegisterLibFunc(&a.gaussians, h, "da_capi_gaussians")
 	return a, nil
 }
@@ -102,8 +109,9 @@ type Cloud struct {
 	Normals []float32 // 3N surface normals (OpenCV space), empty unless surfels requested
 	Counts  []int32   // per source view (frames outer; for build-up prefix sums)
 	// Per-input-frame camera poses (OpenCV world axes), for viewer flythrough. Length 3F each.
-	FramePos []float32 // global camera centre per frame
-	FrameFwd []float32 // global unit view direction per frame
+	FramePos          []float32 // global camera centre per frame
+	FrameFwd          []float32 // global unit view direction per frame
+	TemporalVoxelMesh []byte    // DTVM v1 exposed-face lifetimes, when requested
 }
 
 // PointsMulti runs ONE cross-view pass over the given image files and returns the
@@ -156,13 +164,15 @@ func b2i32(b bool) int32 {
 // loopClose (loop closure + Sim3 pose-graph, task C), and fuse (final voxel/surface
 // fusion, task A) with cell fuseVoxel metres (<=0 => default).
 func (a *capi) PointsStream(ctx uintptr, paths []string, chunk, overlap int, confPct float64, ptSize float32, budget int,
-	icpRefine, loopClose, fuse, metric bool, fuseVoxel, fuseVoxelFrac, fuseTruncMult float64) (*Cloud, error) {
+	icpRefine, loopClose, fuse, metric, temporalVoxelMesh bool,
+	fuseVoxel, fuseVoxelFrac, fuseTruncMult float64) (*Cloud, error) {
 	if len(paths) == 0 {
 		return nil, fmt.Errorf("no images")
 	}
 	// Scene-relative TSDF fusion knobs for this bake's fuse pass (0 => C-side default).
 	// Set before the stream call; consumed inside da_capi_points_stream when fuse is on.
 	a.setFuseParams(ctx, fuseVoxelFrac, fuseTruncMult)
+	a.setTemporalVoxelMesh(ctx, b2i32(temporalVoxelMesh))
 	cs := make([][]byte, len(paths))
 	pp := make([]*byte, len(paths))
 	for i, s := range paths {
@@ -202,6 +212,13 @@ func (a *capi) PointsStream(ctx uintptr, paths []string, chunk, overlap int, con
 		}
 		a.freeFloats(pFramePos)
 		a.freeFloats(pFrameFwd)
+	}
+	if temporalVoxelMesh {
+		var pMesh, meshSize uintptr
+		if a.streamVoxelMesh(ctx, unsafe.Pointer(&pMesh), unsafe.Pointer(&meshSize)) == 0 && pMesh != 0 && meshSize > 0 {
+			cl.TemporalVoxelMesh = cBytes(pMesh, int(meshSize))
+			a.freeBytes(pMesh)
+		}
 	}
 	return cl, nil
 }

@@ -100,7 +100,7 @@ func TestDedupFirstFrame(t *testing.T) {
 	// frame 1: one coincident with frame0's first cell (should drop), two genuinely new
 	pts := [][3]float32{
 		{0.1, 0, 0}, {5.1, 0, 0}, // frame 0 -> cells x=0, x=5
-		{0.2, 0, 0}, // frame 1 -> cell x=0 (dup of frame0) -> DROP
+		{0.2, 0, 0},               // frame 1 -> cell x=0 (dup of frame0) -> DROP
 		{9.1, 0, 0}, {12.1, 0, 0}, // frame 1 -> new cells x=9, x=12 -> KEEP
 	}
 	for _, p := range pts {
@@ -167,5 +167,28 @@ func TestCloudToCubes(t *testing.T) {
 	// empty cell size guard
 	if cloudToCubes(c, c.N, 0) != nil {
 		t.Fatalf("cell<=0 must yield nil")
+	}
+}
+
+func TestParseTemporalMeshManifest(t *testing.T) {
+	b := make([]byte, 32+2*24)
+	copy(b, "DTVM")
+	binary.LittleEndian.PutUint16(b[4:], 1)
+	binary.LittleEndian.PutUint16(b[6:], 32)
+	binary.LittleEndian.PutUint32(b[12:], 9)
+	binary.LittleEndian.PutUint32(b[16:], 2)
+	binary.LittleEndian.PutUint32(b[20:], 1)
+	binary.LittleEndian.PutUint32(b[24:], math.Float32bits(0.125))
+	binary.LittleEndian.PutUint32(b[28:], 24)
+	m, ok := parseTemporalMeshManifest("surface.dtvm", b)
+	if !ok {
+		t.Fatal("valid DTVM header rejected")
+	}
+	if m.File != "surface.dtvm" || m.Format != "dtvm-1" || m.Frames != 9 ||
+		m.Faces != 2 || m.FinalFaces != 1 || m.VoxelSize != 0.125 || m.Bytes != len(b) {
+		t.Fatalf("unexpected manifest: %+v", m)
+	}
+	if _, ok := parseTemporalMeshManifest("bad.dtvm", b[:len(b)-1]); ok {
+		t.Fatal("truncated DTVM accepted")
 	}
 }

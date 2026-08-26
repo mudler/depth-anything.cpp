@@ -73,12 +73,15 @@ int main() {
     {
         std::vector<float> tx=xyz, tr=rad; std::vector<uint8_t> tc=rgb;
         TsdfParams tp; tp.voxel=(float)vox; tp.trunc=5.f*(float)vox; tp.normal_radius=2.5f*(float)vox;
-        int M = fuse_tsdf(tx, tc, tr, tp, nullptr, &cam);
+        TsdfSurface surface;
+        int M = fuse_tsdf(tx, tc, tr, tp, nullptr, &cam, nullptr, nullptr, &surface);
         double th_after = da::eval::thickness_to_plane(to_d(tx,M).data(), M, p0, nz);
         double bias = mean_abs_z(tx, M);
         std::fprintf(stderr, "tsdf : %d pts, thickness=%.4f (%.1f%% of input), mean|z|=%.4f\n",
                      M, th_after, 100.0*th_after/th_before, bias);
         check(M > 1000 && M < Nin, "tsdf outputs a single sheet (fewer pts, non-empty)");
+        check((int)surface.voxels.size() == M && std::abs(surface.voxel_size-(float)vox) < 1e-6f,
+              "tsdf exposes exact occupancy alongside every output point");
         check(th_after < 0.35*th_before, "tsdf COLLAPSES the double (thickness -> near zero)");
         check(bias < 0.5*vox, "tsdf sheet sits on the true midplane (no bias)");
     }

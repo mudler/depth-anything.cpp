@@ -67,6 +67,7 @@ set(DA_SOURCES
     src/stream.cpp
     src/fuse.cpp
     src/tsdf.cpp
+    src/voxel_mesh.cpp
     src/icp.cpp
     src/posegraph.cpp
     src/ray_pose.cpp

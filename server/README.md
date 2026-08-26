@@ -8,10 +8,16 @@ using the depth-anything.cpp (DA3) engine, rendered live in a WebGL splat viewer
   "build-up" playback (`acc_2 … acc_N`).
 * **Create** — upload a video (→ one cross-view DA3 pass → fused cloud) or photos
   (→ multi-view cloud, or single-image gaussians), pick the **model** and the
-  **output type** (point cloud / gaussians), and watch it appear.
+  **output type** (point cloud / voxels / gaussians), and watch it appear.
+* **Merged voxel playback** — fused voxel scenes can include a compact DTVM
+  exposed-face timeline. Each face is stored once with the frame interval in
+  which it is visible, so every build-up step is a merged surface without storing
+  a complete accumulated mesh per frame.
 
 The viewer core (EWA splatting, depth-sort worker, camera) is the same proven
 renderer as free-splatter.cpp; it consumes antimatter15 `.splat` (32 B/record).
+Voxel scenes retain that file as a compatible cube fallback and may additionally
+carry `temporal_faces.dtvm`, generated from the TSDF's exact integer grid.
 
 ## How it works
 
@@ -78,7 +84,7 @@ Catalogued in `models.go`; only those present on disk appear in the picker.
 | `GET /api/scenes` | list baked/uploaded scenes |
 | `POST /api/scene/from-video` | video (+`model`,`mode`,`max_frames`,`conf_pct`) → `{job}` (async) |
 | `GET /api/scene/status/{job}` | `{state,total,done,kept,scene}` |
-| `GET /scenes-assets/...` | a scene's `manifest.json` + `.splat` + thumbnails |
+| `GET /scenes-assets/...` | a scene's `manifest.json` + `.splat`/`.dtvm` + thumbnails |
 
 ## Known limitations
 
@@ -91,3 +97,6 @@ Catalogued in `models.go`; only those present on disk appear in the picker.
   thin edge-on. Multi-view gaussian fusion is future work.
 * The `da3-nested-metric` model gives metric scale on the single-image path; the
   multi-view fuse currently runs its anyview branch (relative, still coherent).
+* Temporal merged meshes currently use one quad per exposed voxel face. Internal
+  faces are culled at every playback step; greedy coplanar rectangle merging is a
+  future size/triangle-count optimization.

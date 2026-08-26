@@ -42,6 +42,20 @@ struct TsdfParams {
     int   min_hits = 2;
 };
 
+// Exact integer-grid surface occupancy extracted by fuse_tsdf.  This is kept
+// alongside the displaced point representation so downstream exporters never
+// have to guess voxel coordinates from floating-point positions.
+struct TsdfVoxel {
+    int32_t x = 0, y = 0, z = 0;
+    uint8_t r = 0, g = 0, b = 0;
+    int first_frame = 0;
+};
+
+struct TsdfSurface {
+    float voxel_size = 0.f;
+    std::vector<TsdfVoxel> voxels;
+};
+
 // In-place normal-space TSDF fusion of a parallel point cloud (xyz: 3N, rgb: 3N,
 // radius: N). Replaces the buffers with the extracted single-sheet surface and
 // returns its point count. `weights` (length N) is per-point confidence used to
@@ -62,6 +76,7 @@ int fuse_tsdf(std::vector<float>& xyz, std::vector<uint8_t>& rgb,
               const std::vector<float>* weights = nullptr,
               const std::vector<float>* cameras = nullptr,
               const std::vector<int>* in_frame = nullptr,
-              std::vector<int>* out_frame = nullptr);
+              std::vector<int>* out_frame = nullptr,
+              TsdfSurface* out_surface = nullptr);
 
 } // namespace da

@@ -55,7 +55,9 @@ int fuse_tsdf(std::vector<float>& xyz, std::vector<uint8_t>& rgb,
               const std::vector<float>* weights,
               const std::vector<float>* cameras,
               const std::vector<int>* in_frame,
-              std::vector<int>* out_frame) {
+              std::vector<int>* out_frame,
+              TsdfSurface* out_surface) {
+    if (out_surface) { out_surface->voxel_size = 0.f; out_surface->voxels.clear(); }
     const int N = (int)(xyz.size()/3);
     if (N < 8) return N;
     const bool have_rgb = ((int)rgb.size() == 3*N);
@@ -186,6 +188,13 @@ int fuse_tsdf(std::vector<float>& xyz, std::vector<uint8_t>& rgb,
 
     const int M = (int)outs.size();
     if (M == 0) return N;   // nothing extracted (degenerate) -> leave input untouched
+    if (out_surface) {
+        out_surface->voxel_size = (float)vox;
+        out_surface->voxels.reserve(outs.size());
+        for (const Out& o : outs) {
+            out_surface->voxels.push_back({o.k.x, o.k.y, o.k.z, o.r, o.g, o.b, o.frame});
+        }
+    }
     std::vector<float> ox(3*M), orad(M); std::vector<uint8_t> orgb(3*M);
     if (out_frame) out_frame->resize(M);
     for (int i = 0; i < M; ++i) {
